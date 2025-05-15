@@ -19,7 +19,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
-            path TEXT NOT NULL,
+            path TEXT NOT NULL, -- Store original case for display, normcase for comparison if needed elsewhere
             prompt_guide TEXT,
             is_active INTEGER DEFAULT 0
         )
@@ -37,17 +37,18 @@ def init_db():
     ''')
 
     # Selections table (files/directories chosen for context)
+    # Path column will now use COLLATE NOCASE for case-insensitive comparisons and uniqueness
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS selections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             project_id INTEGER NOT NULL,
-            path TEXT NOT NULL, -- Full path
+            path TEXT NOT NULL COLLATE NOCASE, -- Full path, case-insensitive
             is_directory INTEGER NOT NULL, -- 0 for file, 1 for directory
             category_id INTEGER,
             file_types TEXT, -- Comma-separated, e.g., ".py,.txt,.md" (for directories)
             FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
             FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE SET NULL,
-            UNIQUE (project_id, path)
+            UNIQUE (project_id, path) -- Uniqueness will also be case-insensitive due to COLLATE NOCASE on path
         )
     ''')
 
@@ -60,7 +61,7 @@ def init_db():
     ''')
     conn.commit()
     conn.close()
-    print(f"Database '{DATABASE_NAME}' initialized.")
+    # print(f"Database '{DATABASE_NAME}' initialized with updated schema (selections.path COLLATE NOCASE).")
 
 # --- App Settings Functions ---
 def get_app_setting(key):
@@ -85,12 +86,17 @@ def set_app_setting(key, value):
 def add_project(name, path, prompt_guide=""):
     conn = get_db_connection()
     try:
+        # Store the original path for projects, normcasing is mainly for selections uniqueness/lookup
+        # However, for consistency in how project paths are handled if they were ever used in complex lookups,
+        # normcasing here too might be safer, but for display, original is often preferred.
+        # For now, let's keep project.path as original, as it's mostly for display and setting root.
+        # If we find issues, we can normcase project.path as well.
         conn.execute("INSERT INTO projects (name, path, prompt_guide) VALUES (?, ?, ?)",
-                     (name, path, prompt_guide))
+                     (name, os.path.normpath(path), prompt_guide)) # normpath for cleanup
         conn.commit()
         return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     except sqlite3.IntegrityError:
-        print(f"Project with name '{name}' already exists.")
+        # print(f"Project with name '{name}' already exists.")
         return None
     finally:
         conn.close()
@@ -129,7 +135,7 @@ def update_project_prompt(project_id, prompt_guide):
 
 def delete_project(project_id):
     conn = get_db_connection()
-    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,)) # Selections/Categories will cascade
+    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     conn.commit()
     conn.close()
 
@@ -142,7 +148,7 @@ def add_category(project_id, name):
         conn.commit()
         return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     except sqlite3.IntegrityError:
-        print(f"Category '{name}' already exists for this project.")
+        # print(f"Category '{name}' already exists for this project.")
         return None
     finally:
         conn.close()
@@ -153,66 +159,120 @@ def get_categories(project_id):
     conn.close()
     return categories
 
+def remove_category_and_uncategorize_items(category_id):
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE selections SET category_id = NULL WHERE category_id = ?", (category_id,))
+        conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        conn.commit()
+        return True
+    except sqlite3.Error as e:
+        print(f"Error removing category {category_id} and uncategorizing items: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
 # --- Selection Functions ---
 def add_selection(project_id, path, is_directory, category_id=None, file_types=None):
     conn = get_db_connection()
+    # Path is already normcased by the caller (MainWindow) before being passed here.
+    # And the table column `selections.path` is `COLLATE NOCASE`.
+    # So, direct insertion of the (already normcased) path is fine.
+    # os.path.normpath is still good for cleaning slashes, etc.
+    clean_path = os.path.normpath(path) # Path is already normcased by caller
+    # print(f"# DB_DEBUG: add_selection - ProjID={project_id}, Path='{clean_path}', IsDir={is_directory}")
     try:
         conn.execute("""
             INSERT INTO selections (project_id, path, is_directory, category_id, file_types)
             VALUES (?, ?, ?, ?, ?)
-        """, (project_id, path, is_directory, category_id, file_types))
+        """, (project_id, clean_path, is_directory, category_id, file_types))
         conn.commit()
-    except sqlite3.IntegrityError: # Path already selected, update it
+    except sqlite3.IntegrityError:
         conn.execute("""
-            UPDATE selections SET category_id = ?, file_types = ? WHERE project_id = ? AND path = ?
-        """, (category_id, file_types, project_id, path))
+            UPDATE selections SET category_id = ?, file_types = ?, is_directory = ?
+            WHERE project_id = ? AND path = ? 
+        """, (category_id, file_types, is_directory, project_id, clean_path)) # Path comparison will be case-insensitive
         conn.commit()
-        print(f"Selection '{path}' updated for project ID {project_id}.")
+        # print(f"# DB_DEBUG: Updated selection: ProjID={project_id}, Path='{clean_path}'")
     finally:
         conn.close()
 
 def get_selections(project_id, category_id=None):
     conn = get_db_connection()
-    query = "SELECT s.*, c.name as category_name FROM selections s LEFT JOIN categories c ON s.category_id = c.id WHERE s.project_id = ?"
+    query = """
+        SELECT s.id, s.project_id, s.path, s.is_directory, s.category_id, s.file_types, c.name as category_name
+        FROM selections s
+        LEFT JOIN categories c ON s.category_id = c.id
+        WHERE s.project_id = ?
+    """
     params = [project_id]
-    if category_id:
+    if category_id is not None:
         query += " AND s.category_id = ?"
         params.append(category_id)
-    
+    # Paths retrieved will be as stored; comparison in WHERE clause is case-insensitive.
     selections = conn.execute(query, params).fetchall()
     conn.close()
     return selections
 
 def get_selection_by_path(project_id, path):
     conn = get_db_connection()
-    selection = conn.execute("SELECT * FROM selections WHERE project_id = ? AND path = ?", (project_id, path)).fetchone()
+    # Path is already normcased by the caller.
+    # The WHERE path = ? comparison will be case-insensitive due to COLLATE NOCASE.
+    clean_path = os.path.normpath(path)
+    # print(f"# DB_DEBUG: get_selection_by_path - Querying ProjID={project_id}, Path='{clean_path}'")
+    selection = conn.execute("SELECT * FROM selections WHERE project_id = ? AND path = ?", (project_id, clean_path)).fetchone()
     conn.close()
     return selection
 
 def remove_selection(project_id, path):
     conn = get_db_connection()
-    conn.execute("DELETE FROM selections WHERE project_id = ? AND path = ?", (project_id, path))
+    # Path is already normcased by the caller.
+    # The WHERE path = ? comparison will be case-insensitive.
+    clean_path = os.path.normpath(path)
+    # print(f"# DB_DEBUG: remove_selection - Removing ProjID={project_id}, Path='{clean_path}'")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM selections WHERE project_id = ? AND path = ?", (project_id, clean_path))
     conn.commit()
+    # if cursor.rowcount > 0:
+        # print(f"# DB_DEBUG: Successfully removed {cursor.rowcount} row(s) for path '{clean_path}'")
+    # else:
+        # print(f"# DB_DEBUG: No rows removed for path '{clean_path}'. It might not exist or case mismatch (pre-COLLATE NOCASE data).")
     conn.close()
 
 def update_selection_category(project_id, path, category_id):
+    """
+    Updates the category_id for a specific selection.
+    Args:
+        project_id (int): The ID of the project.
+        path (str): The normcased path of the selection.
+        category_id (int or None): The new category ID, or None to uncategorize.
+    """
     conn = get_db_connection()
-    conn.execute("UPDATE selections SET category_id = ? WHERE project_id = ? AND path = ?",
-                 (category_id, project_id, path))
-    conn.commit()
-    conn.close()
+    # Path is already normcased by the caller.
+    clean_path = os.path.normpath(path)
+    # print(f"# DB_DEBUG: update_selection_category - Updating ProjID={project_id}, Path='{clean_path}', CatID={category_id}")
+    try:
+        # The SQL statement requires 3 placeholders: category_id, project_id, path
+        # The parameters should be in the order: (new_category_id, project_id_for_where, path_for_where)
+        conn.execute("UPDATE selections SET category_id = ? WHERE project_id = ? AND path = ?",
+                     (category_id, project_id, clean_path)) # Corrected parameter order and count
+        conn.commit()
+        # print(f"# DB_DEBUG: Successfully updated category for path '{clean_path}'")
+    except sqlite3.Error as e:
+        print(f"Error updating selection category for path '{clean_path}': {e}")
+        conn.rollback() # Rollback on error
+    finally:
+        conn.close()
 
 if __name__ == '__main__':
-    # Example Usage (run this file directly to initialize DB)
     if not os.path.exists(DATABASE_NAME):
+        print(f"Database '{DATABASE_NAME}' not found. Initializing with new schema...")
         init_db()
     else:
-        print(f"Database '{DATABASE_NAME}' already exists.")
-        # You might want to call init_db() anyway if you are adding tables to an existing DB
-        # init_db() # Uncomment to ensure new tables are added if DB exists
-
-    # Test app settings
-    # set_app_setting('test_setting', 'test_value')
-    # print(f"Test setting value: {get_app_setting('test_setting')}")
-    # set_app_setting('last_ui_mode', 'gui')
-    # print(f"Last UI Mode: {get_app_setting('last_ui_mode')}")
+        # print(f"Database '{DATABASE_NAME}' already exists. Ensuring schema is up-to-date...")
+        # Calling init_db() on an existing DB won't change schema of existing tables by default.
+        # For the COLLATE NOCASE change to take effect on an existing DB,
+        # the table would need to be altered or recreated.
+        # Simplest for user is to delete the DB file if issues persist.
+        init_db()
