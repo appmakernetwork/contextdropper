@@ -8,13 +8,12 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QTreeView, QFileSystemModel,
     QSplitter, QMenu, QInputDialog, QMessageBox, QComboBox,
-    QHeaderView,
-    QSpacerItem, QSizePolicy, QFileDialog, QAbstractItemView,
-    QPlainTextEdit, QStackedWidget
+    QHeaderView, QSpacerItem, QSizePolicy, QFileDialog, QAbstractItemView,
+    QPlainTextEdit, QStackedWidget, QListWidgetItem
 )
 from PySide6.QtGui import (
     QAction, QClipboard, QCursor, QGuiApplication, QPalette, QColor, QIcon,
-    QPixmap, QPainter
+    QPixmap, QPainter, QFont, QTextOption
 )
 from PySide6.QtCore import (
     Qt, QDir, Slot, QTimer, Signal, QModelIndex, QPoint,
@@ -63,18 +62,17 @@ class ContextStatusFileSystemModel(QFileSystemModel):
         """
         if role == Qt.DisplayRole and index.isValid():
             original_name = super().data(index, role)
+            # Return original name if root path is empty (no project selected)
+            if not self.rootPath(): # Check if root path is empty
+                 return original_name
+
             file_path_abs = self.filePath(index)
             normcased_file_path_from_model = os.path.normcase(os.path.normpath(file_path_abs))
 
             if not self.isDir(index) and self.main_window and self.main_window.current_project_id:
                 if self.main_window._selections_for_display_dirty:
-                    # print(f"# DEBUG (FSModel.data): Rebuilding inclusion cache...")
                     effective_selections = self.main_window.get_effective_selections_for_display()
                     self._cached_selection_details = self.main_window.get_detailed_inclusion_map(effective_selections)
-                    # if self._cached_selection_details:
-                    #     print(f"# DEBUG (FSModel.data): Cache rebuilt. {len(self._cached_selection_details)} files marked (normcased).")
-                    # else:
-                    #     print(f"# DEBUG (FSModel.data): Cache rebuilt. No files marked.")
                     self.main_window._selections_for_display_dirty = False
 
                 if normcased_file_path_from_model in self._cached_selection_details:
@@ -83,7 +81,6 @@ class ContextStatusFileSystemModel(QFileSystemModel):
         return super().data(index, role)
 
     def refresh_display_indicators(self):
-        # print("# DEBUG (FSModel): refresh_display_indicators called")
         if self.main_window:
             self.main_window._selections_for_display_dirty = True
         self.layoutChanged.emit()
@@ -109,7 +106,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Context Dropper")
         self.setGeometry(100, 100, 1200, 800)
         self.current_project_id = None
-        self.current_project_path = None # This will store the normcased project path
+        self.current_project_path = None
         self.current_highlighter = None
         self._selections_for_display_dirty = True
         db_manager.init_db()
@@ -117,7 +114,7 @@ class MainWindow(QMainWindow):
         self.hover_widget = HoverIcon()
         self._load_initial_positions()
         self.load_projects()
-        self.load_active_project()
+        self.load_active_project() # This will call update_ui_for_project_state
         self.hover_widget.drop_context_requested.connect(self.drop_context)
         self.hover_widget.maximize_requested.connect(self.show_main_window_from_hover)
         self.hover_widget.close_application_requested.connect(self.close_application_from_hover)
@@ -150,7 +147,7 @@ class MainWindow(QMainWindow):
             icon_size = self.hover_widget.sizeHint() if not self.hover_widget.size().isEmpty() else self.hover_widget.size()
             if icon_size.isEmpty():
                 icon_size = QSize(self.hover_widget.ICON_DISPLAY_WIDTH,
-                                  self.hover_widget.ICON_AREA_HEIGHT + 2 + 20)
+                                     self.hover_widget.ICON_AREA_HEIGHT + 2 + 20) # Approx button height
             self.hover_widget.move(
                 screen_geometry.x() + (screen_geometry.width() - icon_size.width()) // 2,
                 screen_geometry.y() + (screen_geometry.height() - icon_size.height()) // 2
@@ -202,32 +199,44 @@ class MainWindow(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
+
+        # --- Top Bar ---
         top_bar_layout = QHBoxLayout()
         self.project_combo = QComboBox()
         self.project_combo.currentIndexChanged.connect(self.project_selected_by_combo)
         top_bar_layout.addWidget(QLabel("Active Project:"))
         top_bar_layout.addWidget(self.project_combo, 1)
-        new_project_button = QPushButton("New Project")
-        new_project_button.clicked.connect(self.new_project_dialog)
-        top_bar_layout.addWidget(new_project_button)
-        delete_project_button = QPushButton("Delete Project")
-        delete_project_button.clicked.connect(self.delete_current_project)
-        top_bar_layout.addWidget(delete_project_button)
-        self.delete_project_button = delete_project_button
+        self.new_project_button_main = QPushButton("New Project") # Renamed to avoid clash if placeholder is also a button
+        self.new_project_button_main.clicked.connect(self.new_project_dialog)
+        top_bar_layout.addWidget(self.new_project_button_main)
+        self.delete_project_button = QPushButton("Delete Project")
+        self.delete_project_button.clicked.connect(self.delete_current_project)
+        top_bar_layout.addWidget(self.delete_project_button)
         self.manage_cat_button = QPushButton("Manage Categories")
         self.manage_cat_button.clicked.connect(self.manage_categories_dialog)
         top_bar_layout.addWidget(self.manage_cat_button)
         main_layout.addLayout(top_bar_layout)
+
+        # --- Main Content Area (QStackedWidget) ---
+        self.content_stack = QStackedWidget()
+        main_layout.addWidget(self.content_stack, 1)
+
+        # --- Page 1: Main Interface (with splitter) ---
+        self.main_interface_widget = QWidget()
+        main_interface_layout = QHBoxLayout(self.main_interface_widget)
+        main_interface_layout.setContentsMargins(0,0,0,0)
+
         splitter = QSplitter(Qt.Horizontal)
+
+        # Left Pane (File Tree)
         left_pane = QWidget()
         left_layout = QVBoxLayout(left_pane)
         self.fs_model = ContextStatusFileSystemModel(self)
-        initial_root_path = QDir.currentPath()
-        self.fs_model.setRootPath(initial_root_path)
+        self.fs_model.setRootPath("")
         self.fs_model.setFilter(QDir.AllDirs | QDir.Files | QDir.NoDotAndDotDot)
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.fs_model)
-        self.tree_view.setRootIndex(self.fs_model.index(self.fs_model.rootPath()))
+        self.tree_view.setRootIndex(self.fs_model.index(""))
         self.tree_view.setSortingEnabled(True)
         self.tree_view.sortByColumn(0, Qt.AscendingOrder)
         self.tree_view.setDragEnabled(True)
@@ -242,9 +251,12 @@ class MainWindow(QMainWindow):
         self.tree_view.selectionModel().currentChanged.connect(self._handle_tree_view_selection)
         left_layout.addWidget(self.tree_view)
         splitter.addWidget(left_pane)
+
+        # Right Pane (Prompt, Preview, Selected Items)
         right_pane = QWidget()
         right_layout = QVBoxLayout(right_pane)
         self.right_splitter = QSplitter(Qt.Vertical)
+
         prompt_group = QWidget()
         prompt_layout = QVBoxLayout(prompt_group)
         prompt_layout.setContentsMargins(0,0,0,0)
@@ -253,6 +265,7 @@ class MainWindow(QMainWindow):
         self.prompt_edit.setPlaceholderText("Enter your initial prompt guide here...")
         prompt_layout.addWidget(self.prompt_edit)
         self.right_splitter.addWidget(prompt_group)
+
         preview_group = QWidget()
         preview_layout = QVBoxLayout(preview_group)
         preview_layout.setContentsMargins(0,0,0,0)
@@ -274,6 +287,7 @@ class MainWindow(QMainWindow):
         self.preview_stack.addWidget(self.image_preview_label)
         preview_layout.addWidget(self.preview_stack)
         self.right_splitter.addWidget(preview_group)
+
         selected_group = QWidget()
         selected_layout = QVBoxLayout(selected_group)
         selected_layout.setContentsMargins(0,0,0,0)
@@ -285,13 +299,37 @@ class MainWindow(QMainWindow):
         self.selected_items_list.currentItemChanged.connect(self._handle_selected_items_list_selection)
         selected_layout.addWidget(self.selected_items_list)
         self.right_splitter.addWidget(selected_group)
+
         self.right_splitter.setSizes([350, 300, 350])
         right_layout.addWidget(self.right_splitter)
         splitter.addWidget(right_pane)
+
         splitter.setSizes([400, 800])
-        main_layout.addWidget(splitter, 1)
+        main_interface_layout.addWidget(splitter)
+        self.content_stack.addWidget(self.main_interface_widget)
+
+        # --- Page 2: "No Project" Placeholder ---
+        self.no_project_widget = QWidget()
+        no_project_layout = QVBoxLayout(self.no_project_widget)
+        self.placeholder_label = QLabel() # Will be set up with rich text
+        self.placeholder_label.setAlignment(Qt.AlignCenter)
+        font = QFont()
+        font.setPointSize(16)
+        # Font boldness will be handled by rich text for the non-link part
+        self.placeholder_label.setFont(font)
+        self.placeholder_label.setTextFormat(Qt.RichText)
+        self.placeholder_label.setOpenExternalLinks(False) # We handle link activation manually
+        self.placeholder_label.linkActivated.connect(self.handle_placeholder_link)
+        # Set the text using a method that can be called to update it if needed
+        self._update_placeholder_text()
+        no_project_layout.addWidget(self.placeholder_label)
+        self.content_stack.addWidget(self.no_project_widget)
+
+
+        # --- Bottom Bar ---
         bottom_bar_layout = QHBoxLayout()
-        bottom_bar_layout.addWidget(QLabel("Export Category:"))
+        self.export_category_label = QLabel("Export Category:") # Store reference to label
+        bottom_bar_layout.addWidget(self.export_category_label)
         self.export_category_combo = QComboBox()
         self.export_category_combo.currentIndexChanged.connect(self.refresh_file_tree_display_indicators)
         bottom_bar_layout.addWidget(self.export_category_combo)
@@ -303,19 +341,35 @@ class MainWindow(QMainWindow):
         self.collapse_button.clicked.connect(self.collapse_to_hover_icon)
         bottom_bar_layout.addWidget(self.collapse_button)
         main_layout.addLayout(bottom_bar_layout)
+
         self._show_preview_for_path(None)
-        self.update_ui_for_project_state()
+
+    def _update_placeholder_text(self):
+        """Sets the rich text for the placeholder label."""
+        # Using a known color from the dark palette for the link for better visibility
+        # QPalette().color(QPalette.Link) might also work if palette is set early enough
+        link_color = "#569CD6" # A blue color often used for links in dark themes
+        self.placeholder_label.setText(
+            f'<span style="color: #A0A0A0; font-weight: bold;">Create a '
+            f'<a href="action:new_project" style="color: {link_color}; text-decoration: underline; font-weight: bold;">new project</a>'
+            f' or select an existing one to get started.</span>'
+        )
+
+    def handle_placeholder_link(self, link_str):
+        """Handles clicks on links in the placeholder label."""
+        if link_str == "action:new_project":
+            self.new_project_dialog()
+
 
     def on_prompt_text_changed(self):
         if self.current_project_id:
-            self.prompt_save_timer.start(1000)
+            self.prompt_save_timer.start(1000) # ms delay
 
     def save_prompt_guide_to_db(self):
         if self.current_project_id and self.prompt_edit.toPlainText() is not None:
             db_manager.update_project_prompt(self.current_project_id, self.prompt_edit.toPlainText())
 
     def load_projects(self):
-        # print("# DEBUG (MainWindow.load_projects): Called")
         self.project_combo.blockSignals(True)
         self.project_combo.clear()
         projects = db_manager.get_projects()
@@ -327,31 +381,30 @@ class MainWindow(QMainWindow):
         self.project_combo.blockSignals(False)
 
     def load_active_project(self):
-        # print("# DEBUG (MainWindow.load_active_project): Called")
         active_project_data = db_manager.get_active_project()
         if active_project_data:
             project_id_to_activate = active_project_data['id']
             idx = self.project_combo.findData(project_id_to_activate)
             if idx != -1:
                 self.project_combo.setCurrentIndex(idx)
-                if self.project_combo.currentIndex() == idx and self.current_project_id != project_id_to_activate:
-                    self.update_project_details(project_id_to_activate)
+                if self.current_project_id != project_id_to_activate:
+                     self.update_project_details(project_id_to_activate)
+                elif self.current_project_id == project_id_to_activate :
+                    self.update_ui_for_project_state()
             else:
+                db_manager.set_active_project(None)
                 self.clear_project_context()
-                if self.project_combo.count() > 0 and self.project_combo.itemData(0) is not None:
-                    self.project_combo.setCurrentIndex(0)
-        elif self.project_combo.count() > 0 and self.project_combo.itemData(0) is not None:
-            self.project_combo.setCurrentIndex(0)
         else:
-            self.clear_project_context()
+            if self.project_combo.count() > 0 and self.project_combo.itemData(0) is not None:
+                 self.project_combo.setCurrentIndex(0)
+            else:
+                 self.clear_project_context()
 
     def project_selected_by_combo(self, index):
         project_id = self.project_combo.itemData(index)
-        # print(f"# DEBUG (MainWindow.project_selected_by_combo): Project ID: {project_id}")
         self.update_project_details(project_id)
 
     def update_project_details(self, project_id):
-        # print(f"# DEBUG (MainWindow.update_project_details): Project ID: {project_id}")
         if project_id is None:
             self.clear_project_context()
             return
@@ -360,22 +413,21 @@ class MainWindow(QMainWindow):
         if project:
             self.current_project_id = project['id']
             self.current_project_path = os.path.normcase(os.path.normpath(project['path']))
-            # print(f"# DEBUG (MainWindow.update_project_details): Set current_project_path to (normcased): '{self.current_project_path}'")
 
             self.prompt_edit.blockSignals(True)
             self.prompt_edit.setText(project['prompt_guide'] or "")
             self.prompt_edit.blockSignals(False)
 
-            if os.path.isdir(project['path']): # Check original path for isdir
+            if os.path.isdir(project['path']):
                 self.fs_model.setRootPath(project['path'])
                 self.tree_view.setRootIndex(self.fs_model.index(project['path']))
             else:
                 QMessageBox.warning(self, "Project Path Error",
                                     f"Project path not found: {project['path']}\n"
-                                    "Reverting to default. Update project settings.")
-                fallback_path = QDir.currentPath()
-                self.fs_model.setRootPath(fallback_path)
-                self.tree_view.setRootIndex(self.fs_model.index(fallback_path))
+                                    "Selected project's directory is not accessible. The file tree will be empty.")
+                self.fs_model.setRootPath("")
+                self.tree_view.setRootIndex(self.fs_model.index(""))
+
             db_manager.set_active_project(self.current_project_id)
         else:
             self.clear_project_context()
@@ -386,15 +438,15 @@ class MainWindow(QMainWindow):
         self._show_preview_for_path(None)
 
     def clear_project_context(self):
-        # print("# DEBUG (MainWindow.clear_project_context): Called")
         self.current_project_id = None
-        new_root_path = QDir.currentPath()
-        self.current_project_path = os.path.normcase(os.path.normpath(new_root_path))
+        self.current_project_path = None
         self.prompt_edit.blockSignals(True)
         self.prompt_edit.clear()
         self.prompt_edit.blockSignals(False)
-        self.fs_model.setRootPath(new_root_path)
-        self.tree_view.setRootIndex(self.fs_model.index(new_root_path))
+
+        self.fs_model.setRootPath("")
+        self.tree_view.setRootIndex(self.fs_model.index(""))
+
         db_manager.set_active_project(None)
         self.update_ui_for_project_state()
         self.load_selected_items()
@@ -412,7 +464,10 @@ class MainWindow(QMainWindow):
                     self.load_projects()
                     idx = self.project_combo.findData(project_id)
                     if idx != -1:
+                        self.project_combo.blockSignals(True)
                         self.project_combo.setCurrentIndex(idx)
+                        self.project_combo.blockSignals(False)
+                        self.update_project_details(project_id)
                 else:
                     QMessageBox.warning(self, "Error", f"Could not create project '{name}'. It might already exist.")
         elif ok and not name.strip():
@@ -422,6 +477,7 @@ class MainWindow(QMainWindow):
         if not self.current_project_id:
             QMessageBox.information(self, "No Project", "No project is active to delete.")
             return
+
         project_name = self.project_combo.currentText()
         reply = QMessageBox.question(self, "Confirm Delete",
                                      f"Are you sure you want to delete project '{project_name}'?",
@@ -437,11 +493,9 @@ class MainWindow(QMainWindow):
             return
         dialog = ManageCategoriesDialog(self.current_project_id, parent_main_window=self)
         dialog.exec()
-        # print("# DEBUG (MainWindow.manage_categories_dialog): Dialog closed, refreshing tree indicators.")
         self.refresh_file_tree_display_indicators()
 
     def load_categories_for_export(self):
-        # print("# DEBUG (MainWindow.load_categories_for_export): Called")
         self.export_category_combo.blockSignals(True)
         self.export_category_combo.clear()
         self.export_category_combo.addItem("All Categories", None)
@@ -454,97 +508,150 @@ class MainWindow(QMainWindow):
 
     def update_ui_for_project_state(self):
         has_project = self.current_project_id is not None
+
+        if has_project:
+            self.content_stack.setCurrentWidget(self.main_interface_widget)
+        else:
+            self.content_stack.setCurrentWidget(self.no_project_widget)
+            self._update_placeholder_text() # Ensure placeholder text is correct
+
+        # Enable/disable components based on project presence
+        self.tree_view.setEnabled(has_project)
         self.prompt_edit.setEnabled(has_project)
         self.selected_items_list.setEnabled(has_project)
-        self.drop_context_button.setEnabled(has_project)
-        if hasattr(self, 'preview_stack'):
-            self.preview_stack.setEnabled(has_project)
-        if hasattr(self, 'delete_project_button'):
-            self.delete_project_button.setEnabled(has_project)
-        if hasattr(self, 'manage_cat_button'):
-            self.manage_cat_button.setEnabled(has_project)
-        self.export_category_combo.setEnabled(has_project)
+        if hasattr(self, 'preview_stack'): self.preview_stack.setEnabled(has_project)
 
-    def tree_context_menu(self, position):
-        if not self.current_project_id: return
+        # Set visibility for project-specific buttons and controls
+        self.delete_project_button.setVisible(has_project)
+        self.manage_cat_button.setVisible(has_project)
+        self.export_category_label.setVisible(has_project)
+        self.export_category_combo.setVisible(has_project)
+        self.drop_context_button.setVisible(has_project)
+        self.collapse_button.setVisible(has_project)
+
+
+        if has_project:
+            project_name = self.project_combo.currentText()
+            self.setWindowTitle(f"Context Dropper - {project_name}")
+        else:
+            self.setWindowTitle("Context Dropper")
+
+    def _add_project_root_actions_to_menu(self, menu: QMenu):
+        if not self.current_project_id or not self.current_project_path or not os.path.isdir(self.current_project_path):
+            return False
+
+        r_path = self.current_project_path
+        r_is_dir = True
+        existing_root_sel = db_manager.get_selection_by_path(self.current_project_id, r_path)
+
+        if existing_root_sel:
+            menu.addAction("Project Root (.): Options...",
+                           lambda path=r_path, is_dir=r_is_dir, sel=existing_root_sel: self.add_or_update_selection(path, is_dir, sel))
+            menu.addAction("Project Root (.): Assign/Change Category...",
+                           lambda path=r_path: self.assign_category_to_selection_dialog(path))
+            menu.addAction("Project Root (.): Remove from Context",
+                           lambda path=r_path: self.remove_selected_path(path))
+        else:
+            menu.addAction("Project Root (.): Add to Context",
+                           lambda path=r_path, is_dir=r_is_dir: self.add_or_update_selection(path, is_dir, None))
+        return True
+
+    def tree_context_menu(self, position: QPoint):
+        if not self.current_project_id:
+            return
+
         index = self.tree_view.indexAt(position)
         menu = QMenu()
-        if not index.isValid():
-            if self.current_project_path and os.path.isdir(self.current_project_path):
-                root_path_for_db = self.current_project_path # Already normcased
-                existing_root_selection = db_manager.get_selection_by_path(self.current_project_id, root_path_for_db)
-                if existing_root_selection:
-                    menu.addAction("Project Root (.) Options", lambda: self.add_or_update_selection(root_path_for_db, True, existing_root_selection))
-                    menu.addAction("Assign/Change Category for Project Root (.)", lambda: self.assign_category_to_selection_dialog(root_path_for_db))
-                    menu.addAction("Remove Project Root (.) from Context", lambda: self.remove_selected_path(root_path_for_db))
-                else:
-                    menu.addAction("Add Project Root (.) to Context", lambda: self.add_or_update_selection(root_path_for_db, True, None))
-        else:
+        item_actions_added = False
+        root_actions_added = False
+
+        if index.isValid():
             path_from_model = self.fs_model.filePath(index)
             normcased_path = os.path.normcase(os.path.normpath(path_from_model))
             is_dir = self.fs_model.isDir(index)
             existing_selection = db_manager.get_selection_by_path(self.current_project_id, normcased_path)
+
+            item_display_name = os.path.basename(normcased_path)
+            if not item_display_name and normcased_path == self.current_project_path:
+                item_display_name = "."
+            elif not item_display_name:
+                 item_display_name = normcased_path
+
             if existing_selection:
-                action_text = "Directory Options (File Types)" if is_dir else "Item Options"
-                menu.addAction(action_text, lambda: self.add_or_update_selection(normcased_path, is_dir, existing_selection))
-                menu.addAction("Assign/Change Category", lambda: self.assign_category_to_selection_dialog(normcased_path))
-                menu.addAction("Remove from Context", lambda: self.remove_selected_path(normcased_path))
+                action_text = f"'{item_display_name}': Directory Options..." if is_dir else f"'{item_display_name}': Item Options..."
+                menu.addAction(action_text, lambda p=normcased_path, d=is_dir, s=existing_selection: self.add_or_update_selection(p, d, s))
+                menu.addAction(f"'{item_display_name}': Assign/Change Category...", lambda p=normcased_path: self.assign_category_to_selection_dialog(p))
+                menu.addAction(f"'{item_display_name}': Remove from Context", lambda p=normcased_path: self.remove_selected_path(p))
             else:
-                action_text = "Add Directory to Context" if is_dir else "Add File to Context"
-                menu.addAction(action_text, lambda: self.add_or_update_selection(normcased_path, is_dir))
-        if not menu.isEmpty():
+                action_text = f"'{item_display_name}': Add Directory to Context" if is_dir else f"'{item_display_name}': Add File to Context"
+                menu.addAction(action_text, lambda p=normcased_path, d=is_dir: self.add_or_update_selection(p, d))
+            item_actions_added = True
+
+        if item_actions_added and not menu.isEmpty():
+            menu.addSeparator()
+
+        root_actions_added = self._add_project_root_actions_to_menu(menu)
+
+        if (item_actions_added or root_actions_added) and not menu.isEmpty():
             menu.exec(self.tree_view.viewport().mapToGlobal(position))
 
+
     def add_or_update_selection(self, path, is_dir, existing_selection=None):
-        # print(f"# DEBUG (MainWindow.add_or_update_selection): Path: '{path}', IsDir: {is_dir}")
         if not self.current_project_id:
             QMessageBox.warning(self, "No Project Active", "Cannot add selection: no project is active.")
             return
+
         file_types = None
         category_id = existing_selection['category_id'] if existing_selection else None
-        path_for_db = os.path.normcase(os.path.normpath(path)) # Ensure it's normcased for DB
+        path_for_db = os.path.normpath(path)
 
         if is_dir:
             current_types = ""
             if existing_selection and existing_selection['file_types']:
                 current_types = existing_selection['file_types']
-            elif not existing_selection: # Default types for new directory selections
+            elif not existing_selection:
                 current_types = ".py,.js,.dart,.html,.htm,.yaml,.json,.txt,.md,.h,.hpp,.cs,.java,.go,.php,.rb,.swift,.kt,.rs,CMakeLists.txt,Makefile,Dockerfile"
+
             types_str, ok = QInputDialog.getText(self, "Include File Types (Directory)",
                                                  "Comma-separated (e.g., .py,.txt) or exact filenames.\nEmpty for ALL files (recursive).",
                                                  text=current_types)
             if not ok: return
             file_types = types_str.strip() if types_str.strip() else None
+
         db_manager.add_selection(self.current_project_id, path_for_db, is_dir, category_id, file_types)
         self.load_selected_items()
 
     def handle_dropped_item_signal(self, path, is_dir):
         normcased_path = os.path.normcase(os.path.normpath(path))
-        # print(f"# DEBUG (MainWindow.handle_dropped_item_signal): Path: '{path}', Normcased: '{normcased_path}', IsDir: {is_dir}")
         if not self.current_project_id:
             QMessageBox.warning(self, "No Active Project", "Please select or create a project first.")
             return
         existing_selection = db_manager.get_selection_by_path(self.current_project_id, normcased_path)
         self.add_or_update_selection(normcased_path, is_dir, existing_selection)
 
+
     def assign_category_to_selection_dialog(self, path):
-        # print(f"# DEBUG (MainWindow.assign_category_to_selection_dialog): Path (normcased): '{path}'")
         if not self.current_project_id: return
+
         categories = db_manager.get_categories(self.current_project_id)
         cat_names = ["<No Category>"] + [c['name'] for c in categories]
-        current_selection = db_manager.get_selection_by_path(self.current_project_id, path) # path is already normcased
+
+        current_selection = db_manager.get_selection_by_path(self.current_project_id, path)
         if not current_selection:
             QMessageBox.warning(self, "Error", f"Could not find selection data for path:\n{path}")
             return
+
         current_cat_id = current_selection['category_id']
         current_idx = 0
         if current_cat_id:
             for i, cat in enumerate(categories):
                 if cat['id'] == current_cat_id:
                     current_idx = i + 1; break
+
         item_display_name = os.path.basename(path)
-        if path == self.current_project_path : # self.current_project_path is normcased
+        if self.current_project_path and path == self.current_project_path :
             item_display_name = ". (Project Root)"
+
         cat_name, ok = QInputDialog.getItem(self, "Assign Category", f"Category for:\n{item_display_name}",
                                             cat_names, current_idx, False)
         if ok:
@@ -552,39 +659,38 @@ class MainWindow(QMainWindow):
             if cat_name != "<No Category>":
                 for cat in categories:
                     if cat['name'] == cat_name: new_category_id = cat['id']; break
-            db_manager.update_selection_category(self.current_project_id, path, new_category_id) # path is normcased
+            db_manager.update_selection_category(self.current_project_id, path, new_category_id)
             self.load_selected_items()
 
     def remove_selected_path(self, path):
-        # print(f"# DEBUG (MainWindow.remove_selected_path): Path (normcased): '{path}'")
         if self.current_project_id:
-            db_manager.remove_selection(self.current_project_id, path) # path is normcased
+            db_manager.remove_selection(self.current_project_id, path)
             self.load_selected_items()
 
     def load_selected_items(self):
-        # print("# DEBUG (MainWindow.load_selected_items): Called")
         self.selected_items_list.clear()
         if not self.current_project_id:
             self._show_preview_for_path(None)
             self.refresh_file_tree_display_indicators()
             return
 
-        selections = db_manager.get_selections(self.current_project_id) # Gets normcased paths
-        # print(f"# DEBUG (MainWindow.load_selected_items): Fetched {len(selections)} selections from DB.")
-        from PySide6.QtWidgets import QListWidgetItem # Keep local import
+        selections = db_manager.get_selections(self.current_project_id)
         for sel_idx, sel in enumerate(selections):
-            sel_normcased_path = sel['path'] # This is already normcased from DB
-            # print(f"# DEBUG (MainWindow.load_selected_items): Item {sel_idx}: DB path (normcased)='{sel_normcased_path}'")
+            sel_normcased_path = sel['path']
 
             item_display_path = ""
-            if self.current_project_path and os.path.isdir(self.current_project_path): # self.current_project_path is normcased
+            if self.current_project_path and os.path.isdir(self.current_project_path):
                 if sel_normcased_path == self.current_project_path: item_display_path = "."
                 elif sel_normcased_path.startswith(self.current_project_path + os.sep):
                     try: item_display_path = os.path.relpath(sel_normcased_path, self.current_project_path)
-                    except ValueError: item_display_path = os.path.basename(sel_normcased_path) # Fallback if relpath fails
-                else: item_display_path = f"{os.path.basename(sel_normcased_path)} (External)" # Should be rare now
-            else: # Fallback if project path isn't set or valid
+                    except ValueError: item_display_path = os.path.basename(sel_normcased_path)
+                else:
+                    item_display_path = f"{os.path.basename(sel_normcased_path)} (External to current project tree)"
+            else:
                 item_display_path = os.path.basename(sel_normcased_path)
+                if sel_normcased_path != item_display_path :
+                    item_display_path = f"{sel_normcased_path} (Full Path)"
+
 
             display_text_final = ""
             if sel['is_directory']:
@@ -592,63 +698,54 @@ class MainWindow(QMainWindow):
                 if item_display_path == ".": display_text_final = f". (Dir: {file_types_display})"
                 else: display_text_final = f"{item_display_path}{os.sep} (Dir: {file_types_display})"
             else: display_text_final = item_display_path
-            
-            # --- MODIFICATION START ---
-            if sel['category_name']: # Only add category if it exists
+
+            if sel['category_name']:
                 display_text_final += f"  [{sel['category_name']}]"
-            # --- MODIFICATION END ---
 
             item = QListWidgetItem(display_text_final)
-            item.setData(Qt.UserRole, sel_normcased_path) # Store normcased path
-            item.setToolTip(sel_normcased_path) # Show full normcased path on hover
+            item.setData(Qt.UserRole, sel_normcased_path)
+            item.setToolTip(sel_normcased_path)
             self.selected_items_list.addItem(item)
-        
-        if not selections: # If list is empty after loading
-             self._show_preview_for_path(None) # Clear preview
+
+        if not selections:
+             self._show_preview_for_path(None)
 
         self.refresh_file_tree_display_indicators()
-
 
     def selected_item_context_menu(self, position):
         item = self.selected_items_list.itemAt(position)
         if not item or not self.current_project_id: return
 
-        normcased_path_from_user_role = item.data(Qt.UserRole) # This is normcased
-        # print(f"# DEBUG (MainWindow.selected_item_context_menu): Path from UserRole (normcased): '{normcased_path_from_user_role}'")
+        normcased_path_from_user_role = item.data(Qt.UserRole)
 
         if not normcased_path_from_user_role or not isinstance(normcased_path_from_user_role, str):
-             QMessageBox.warning(self, "Error", f"Invalid path data in selected item: {normcased_path_from_user_role}")
-             return
+            QMessageBox.warning(self, "Error", f"Invalid path data in selected item: {normcased_path_from_user_role}")
+            return
 
         selection_data = db_manager.get_selection_by_path(self.current_project_id, normcased_path_from_user_role)
-        # print(f"# DEBUG (MainWindow.selected_item_context_menu): DB query for normcased path '{normcased_path_from_user_role}' returned: {selection_data}")
 
         menu = QMenu()
         menu_item_display_name = os.path.basename(normcased_path_from_user_role)
-        if normcased_path_from_user_role == self.current_project_path: # self.current_project_path is normcased
-             menu_item_display_name = ". (Project Root)"
+        if self.current_project_path and normcased_path_from_user_role == self.current_project_path:
+            menu_item_display_name = ". (Project Root)"
 
-        # Always allow removal
+
         remove_action = menu.addAction(f"Remove '{menu_item_display_name}' from Context")
-        remove_action.triggered.connect(lambda: self.remove_selected_path(normcased_path_from_user_role))
+        remove_action.triggered.connect(lambda checked=False, p=normcased_path_from_user_role: self.remove_selected_path(p))
 
-        if selection_data: # Only add other options if we have full selection data
+
+        if selection_data:
             assign_cat_action = menu.addAction(f"Assign/Change Category for '{menu_item_display_name}'")
-            assign_cat_action.triggered.connect(lambda: self.assign_category_to_selection_dialog(normcased_path_from_user_role))
+            assign_cat_action.triggered.connect(lambda checked=False, p=normcased_path_from_user_role: self.assign_category_to_selection_dialog(p))
+
             if selection_data['is_directory']:
                 edit_types_action = menu.addAction(f"Edit Directory Options for '{menu_item_display_name}'")
-                edit_types_action.triggered.connect(lambda: self.add_or_update_selection(normcased_path_from_user_role, True, selection_data))
+                edit_types_action.triggered.connect(lambda checked=False, p=normcased_path_from_user_role, s=selection_data: self.add_or_update_selection(p, True, s))
         else:
-            # This case implies an issue, e.g., item in list but not in DB (should be rare)
-            # The "Remove" action is still available.
-            # A warning might have already been shown if `get_selection_by_path` returned None and was critical.
-            # For the context menu, just providing "Remove" is a safe fallback.
-            print(f"# WARNING (MainWindow.selected_item_context_menu): No full selection data for '{normcased_path_from_user_role}'. Offering limited menu.")
+            print(f"Warning: No DB selection data found for list item: {normcased_path_from_user_role}")
 
-
-        if menu.isEmpty(): # Should not happen if Remove is always added
+        if menu.isEmpty():
             return
-
         menu.exec(self.selected_items_list.mapToGlobal(position))
 
 
@@ -659,7 +756,7 @@ class MainWindow(QMainWindow):
             with open(file_path, 'rb') as f_check:
                 chunk = f_check.read(1024)
                 if b'\x00' in chunk: return True
-        except Exception: return True # If we can't even check, assume binary to be safe
+        except Exception: return True
         return False
 
     def _read_file_content_for_preview(self, file_path):
@@ -671,7 +768,7 @@ class MainWindow(QMainWindow):
                 return True, (f"File: {os.path.basename(file_path)}\n\n"
                               f"(File too large: {file_size // (1024*1024)} MB. "
                               f"Max: {MainWindow.MAX_PREVIEW_SIZE // (1024*1024)} MB)")
-            # Attempt to read with UTF-8, replace errors
+
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
             return False, content
@@ -681,45 +778,47 @@ class MainWindow(QMainWindow):
             return True, f"File: {os.path.basename(file_path)}\n\n(Error reading file for preview: {e})"
 
     def _generate_directory_preview_summary(self, dir_path):
-        p = Path(dir_path) # Use pathlib for easier traversal
+        p = Path(dir_path)
         try:
             num_files, num_subdirs = 0, 0
             ext_counts = collections.defaultdict(int)
-            # Recursively iterate through all items in the directory
-            for item in p.rglob('*'): # rglob for recursive
+
+            for item in p.rglob('*'):
                 if item.is_file():
                     num_files += 1
                     ext_counts[item.suffix.lower() if item.suffix else "<no_extension>"] += 1
                 elif item.is_dir():
                     num_subdirs += 1
-            
+
             summary = [f"Directory: {os.path.basename(dir_path)} (at {dir_path})",
                        f"Contains: {num_files} files, {num_subdirs} subdirectories (recursively)."]
             if ext_counts:
-                # Sort extensions by count (desc) then name (asc)
                 sorted_ext = sorted(ext_counts.items(), key=lambda x: (-x[1], x[0]))
                 summary.append("File types: " + ", ".join([f"{c} {e if e != '<no_extension>' else 'files w/o ext'}" for e, c in sorted_ext]) + ".")
             elif num_files == 0 and num_subdirs == 0:
                  summary.append("This directory is empty.")
-            elif num_files == 0: # Has subdirs but no files
+            elif num_files == 0:
                  summary.append("No files found in this directory or subdirectories.")
+
             return "\n".join(summary)
         except Exception as e:
             return f"Error scanning directory {dir_path}: {e}"
 
 
     def _show_preview_for_path(self, path):
-        if not self.preview_stack: return # Should not happen if UI is set up
-        # Clear previous syntax highlighter if any
+        if not self.preview_stack: return
+
         if self.current_highlighter:
             self.current_highlighter.setDocument(None)
             self.current_highlighter = None
-        
-        self.image_preview_label.clear() # Clear image preview
-        self.file_preview_edit.clear()   # Clear text preview
+
+        self.image_preview_label.clear()
+        self.file_preview_edit.clear()
 
         if not path:
-            self.file_preview_edit.setPlaceholderText("Click a file or directory in the tree or selected items list to preview its content or summary.")
+            self.file_preview_edit.setPlaceholderText("No project selected, or selected item has no preview.")
+            if self.current_project_id:
+                 self.file_preview_edit.setPlaceholderText("Click a file or directory in the tree or selected items list to preview its content or summary.")
             self.preview_stack.setCurrentWidget(self.file_preview_edit)
             return
 
@@ -729,30 +828,24 @@ class MainWindow(QMainWindow):
             return
 
         _, ext = os.path.splitext(path)
-        ext = ext.lower() # Normalize extension to lowercase
+        ext = ext.lower()
 
-        # Get the current size of the preview area for scaling images
-        preview_size = self.preview_stack.size() # This is the QStackedWidget's size
+        preview_size = self.preview_stack.size()
         if not (preview_size.isValid() and preview_size.width() > 0 and preview_size.height() > 0):
-            # Fallback if size is not yet determined (e.g., during init)
-            preview_size = QSize(300, 300) # A reasonable default
+            preview_size = QSize(300, 300)
 
         if os.path.isfile(path):
-            # Handle Raster Images (PNG, JPG, etc.)
             if ext in self.RASTER_IMAGE_EXTENSIONS:
                 pixmap = QPixmap(path)
                 if pixmap.isNull():
                     self.file_preview_edit.setPlainText(f"File: {os.path.basename(path)}\n\n(Error loading image)")
                     self.preview_stack.setCurrentWidget(self.file_preview_edit)
                 else:
-                    # Scale pixmap if it's larger than the preview area, maintaining aspect ratio
                     if pixmap.width() > preview_size.width() or pixmap.height() > preview_size.height():
                         pixmap = pixmap.scaled(preview_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                     self.image_preview_label.setPixmap(pixmap)
                     self.preview_stack.setCurrentWidget(self.image_preview_label)
                 return
-
-            # Handle SVG Images
             elif ext in self.SVG_IMAGE_EXTENSIONS:
                 if SVG_SUPPORT_AVAILABLE and QSvgRenderer:
                     renderer = QSvgRenderer(path)
@@ -762,170 +855,129 @@ class MainWindow(QMainWindow):
                     else:
                         svg_size = renderer.defaultSize()
                         if not (svg_size.isValid() and svg_size.width() > 0 and svg_size.height() > 0) :
-                            svg_size = preview_size # Use preview area size if SVG has no default
+                            svg_size = preview_size
 
-                        # Determine target size for rendering, scaled to fit preview_size
                         target_size = svg_size
                         if svg_size.width() > preview_size.width() or svg_size.height() > preview_size.height():
                             target_size = svg_size.scaled(preview_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                        
+
                         if not (target_size.isValid() and target_size.width() > 0 and target_size.height() > 0):
                             target_size = QSize(min(preview_size.width(),100), min(preview_size.height(),100))
 
-
                         img = QPixmap(target_size)
-                        img.fill(Qt.transparent) # Ensure transparent background for SVG
+                        img.fill(Qt.transparent)
                         painter = QPainter(img)
-                        renderer.render(painter, QRectF(img.rect())) # Render onto QPixmap
+                        renderer.render(painter, QRectF(img.rect()))
                         painter.end()
                         self.image_preview_label.setPixmap(img)
                         self.preview_stack.setCurrentWidget(self.image_preview_label)
-                else: # SVG support not available
+                else:
                     self.file_preview_edit.setPlainText(f"File: {os.path.basename(path)}\n\n(SVG preview unavailable - QtSvg module missing)")
                     self.preview_stack.setCurrentWidget(self.file_preview_edit)
                 return
 
-            # Handle Text-based files
             is_message_only, content = self._read_file_content_for_preview(path)
             self.file_preview_edit.setPlainText(content)
             self.preview_stack.setCurrentWidget(self.file_preview_edit)
-            if not is_message_only: # If actual content was read (not a binary/error message)
-                # Apply syntax highlighting if it's a supported text file type
+            if not is_message_only:
                 supported_syntax_extensions = [
                     '.py', '.js', '.dart', '.html', '.htm', '.yaml', '.json', '.txt', '.md',
                     '.java', '.cs', '.cpp', '.c', '.h', '.hpp', '.go', '.php', '.rb', '.swift', '.kt', '.rs'
-                    # Add more as needed, ensure they match SyntaxHighlighter keys
                 ]
                 if ext in supported_syntax_extensions:
                     self.current_highlighter = SyntaxHighlighter(self.file_preview_edit.document(), ext)
-        
         elif os.path.isdir(path):
             self.file_preview_edit.setPlainText(self._generate_directory_preview_summary(path))
             self.preview_stack.setCurrentWidget(self.file_preview_edit)
-        else: # Not a file or directory (e.g., broken symlink)
+        else:
             self.file_preview_edit.setPlainText(f"Not a file or directory: {path}")
             self.preview_stack.setCurrentWidget(self.file_preview_edit)
 
     @Slot(QModelIndex, QModelIndex)
-    def _handle_tree_view_selection(self, current, previous):
-        if current.isValid():
+    def _handle_tree_view_selection(self, current: QModelIndex, previous: QModelIndex):
+        if current.isValid() and self.fs_model.rootPath() != "":
             self._show_preview_for_path(self.fs_model.filePath(current))
+        elif not self.fs_model.rootPath():
+             self._show_preview_for_path(None)
 
-    @Slot(object, object) # QListWidgetItem, QListWidgetItem
-    def _handle_selected_items_list_selection(self, current, previous):
-        if current: # current is QListWidgetItem
-            self._show_preview_for_path(current.data(Qt.UserRole)) # UserRole stores the path
-        else: # No item selected
+    @Slot(object, object)
+    def _handle_selected_items_list_selection(self, current: QListWidgetItem, previous: QListWidgetItem):
+        if current:
+            self._show_preview_for_path(current.data(Qt.UserRole))
+        else:
             self._show_preview_for_path(None)
 
-
     def get_effective_selections_for_display(self):
-        # print("# DEBUG (MainWindow.get_effective_selections_for_display): Called")
         if not self.current_project_id:
             return []
-        
-        category_id_filter = self.export_category_combo.currentData() # This can be None for "All Categories"
-        # print(f"# DEBUG (MainWindow.get_effective_selections_for_display): Export Category ID Filter: {category_id_filter}")
-        
-        # Fetch selections. If category_id_filter is None, db_manager.get_selections should handle it
-        # by returning all selections for the project. If it's an ID, it filters by that ID.
+        category_id_filter = self.export_category_combo.currentData()
         selections = db_manager.get_selections(self.current_project_id, category_id_filter)
-        # print(f"# DEBUG (MainWindow.get_effective_selections_for_display): Found {len(selections)} selections (paths are normcased).")
         return selections
 
-
     def get_detailed_inclusion_map(self, effective_selections):
-        # print(f"# DEBUG (MainWindow.get_detailed_inclusion_map): Called with {len(effective_selections)} selections.")
-        included_files_map = {} # Stores {normcased_absolute_file_path: True}
-        
-        # Ensure current_project_path is valid before proceeding, as it's used for os.walk context
-        # However, selections can be outside the project path, so this check is more about context.
-        if not self.current_project_path or not os.path.isdir(self.current_project_path): # current_project_path is normcased
-            # This doesn't necessarily mean an error if all selections are external,
-            # but os.walk behavior on a non-existent path would be problematic.
-            # The primary loop iterates `effective_selections`, which handles paths directly.
-            # print(f"# DEBUG (MainWindow.get_detailed_inclusion_map): Project path '{self.current_project_path}' not valid or not a dir. Proceeding with selection paths directly.")
-            pass # Continue, as individual selection paths are checked.
-
+        included_files_map = {}
         for sel_idx, sel in enumerate(effective_selections):
-            sel_normcased_path = sel['path'] # Already normcased from DB
-            # print(f"# DEBUG (MainWindow.get_detailed_inclusion_map): Processing selection {sel_idx}: '{sel_normcased_path}', IsDir: {sel['is_directory']}")
+            sel_normcased_path = sel['path']
 
-            if not os.path.exists(sel_normcased_path): # Critical check for each selection
-                # print(f"# WARNING (MainWindow.get_detailed_inclusion_map): Path for selection {sel_idx} ('{sel_normcased_path}') does not exist. Skipping.")
+            if not os.path.exists(sel_normcased_path):
                 continue
 
             if sel['is_directory']:
-                # Parse file_types string for this directory selection
                 extensions_to_include = []
                 exact_filenames_to_include_normcased = []
-                include_all_files = True # Default if file_types is None or empty
+                include_all_files_in_dir = True
 
-                if sel['file_types']: # If not None and not empty string
-                    include_all_files = False # Specific filters are present
+                if sel['file_types']:
+                    include_all_files_in_dir = False
                     for ft_item_raw in sel['file_types'].split(','):
                         ft_item = ft_item_raw.strip()
-                        if not ft_item: continue # Skip empty parts
+                        if not ft_item: continue
                         if ft_item.startswith('.'):
-                            extensions_to_include.append(ft_item.lower()) # Store extensions lowercase
+                            extensions_to_include.append(ft_item.lower())
                         else:
                             exact_filenames_to_include_normcased.append(os.path.normcase(ft_item))
-                    # print(f"# DEBUG (MainWindow.get_detailed_inclusion_map): Dir '{sel_normcased_path}' filters: Exts={extensions_to_include}, Names={exact_filenames_to_include_normcased}")
 
-
-                # Walk the directory (using the normcased path from selection)
                 for root, dirnames, filenames in os.walk(sel_normcased_path):
-                    # Filter out commonly ignored directory names from further traversal
-                    # This is for os.walk's own traversal, not for the context.txt tree summary.
-                    # context_generator.DEFAULT_TREE_IGNORED_NAMES is used for the summary.
-                    # A similar list might be useful here if certain subdirs should always be skipped for content.
                     dirnames[:] = [d for d in dirnames if d not in context_generator.DEFAULT_TREE_IGNORED_NAMES and not d.startswith('.')]
 
                     for f_name_original_case in filenames:
                         f_path_abs_normcased = os.path.normcase(os.path.normpath(os.path.join(root, f_name_original_case)))
-                        f_name_normcased = os.path.normcase(f_name_original_case) # Normcase filename for matching
+                        f_name_normcased = os.path.normcase(f_name_original_case)
 
                         should_include_this_file = False
-                        if include_all_files:
+                        if include_all_files_in_dir:
                             should_include_this_file = True
                         else:
                             if f_name_normcased in exact_filenames_to_include_normcased:
                                 should_include_this_file = True
                             elif any(f_name_normcased.endswith(ext) for ext in extensions_to_include):
                                 should_include_this_file = True
-                        
+
                         if should_include_this_file:
                             included_files_map[f_path_abs_normcased] = True
-                            # print(f"# DEBUG (MainWindow.get_detailed_inclusion_map): Added file by dir filter: '{f_path_abs_normcased}'")
-            
-            else: # It's a single file selection
-                included_files_map[sel_normcased_path] = True # Add the normcased path of the file
-                # print(f"# DEBUG (MainWindow.get_detailed_inclusion_map): Added single file: '{sel_normcased_path}'")
-        
-        # print(f"# DEBUG (MainWindow.get_detailed_inclusion_map): Total {len(included_files_map)} unique files marked for inclusion.")
+            else:
+                included_files_map[sel_normcased_path] = True
         return included_files_map
 
 
     def refresh_file_tree_display_indicators(self):
-        # print("# DEBUG (MainWindow.refresh_file_tree_display_indicators): Called")
         if hasattr(self.fs_model, 'refresh_display_indicators'):
-            self.fs_model.refresh_display_indicators() # Call custom method if exists
-        elif isinstance(self.fs_model, QFileSystemModel): # Fallback for standard model
-            self.fs_model.layoutChanged.emit() # Generic way to request a refresh
+            self.fs_model.refresh_display_indicators()
+        elif isinstance(self.fs_model, QFileSystemModel):
+            self.fs_model.layoutChanged.emit()
 
 
     def drop_context(self):
-        if not self.current_project_id or not self.current_project_path: # current_project_path is normcased
-            QMessageBox.warning(self, "Error", "No active project selected.")
+        if not self.current_project_id or not self.current_project_path:
+            QMessageBox.warning(self, "Error", "No active project selected, or project path is invalid.")
             return
 
-        # Fetch the original-case project path from DB for file operations
         project_data = db_manager.get_project_by_id(self.current_project_id)
         if not project_data or not project_data['path']:
             QMessageBox.critical(self, "Critical Error", "Could not retrieve project path from database.")
             return
-        original_project_path_from_db = project_data['path'] # This is the original case path
 
+        original_project_path_from_db = project_data['path']
         if not os.path.isdir(original_project_path_from_db):
             QMessageBox.warning(self, "Error", f"Project path is invalid or not a directory: {original_project_path_from_db}")
             return
@@ -933,42 +985,34 @@ class MainWindow(QMainWindow):
         prompt_text = self.prompt_edit.toPlainText()
         QGuiApplication.clipboard().setText(prompt_text)
 
-        # Determine anchor for notification (main window or hover icon)
         anchor_widget = self
         if not self.isVisible() or self.isMinimized():
             if self.hover_widget and self.hover_widget.isVisible():
                 anchor_widget = self.hover_widget
 
-        # Get selections based on the current export category filter
-        export_category_filter_id = self.export_category_combo.currentData() # Can be None for "All"
+        export_category_filter_id = self.export_category_combo.currentData()
         selections_for_context = db_manager.get_selections(self.current_project_id, export_category_filter_id)
-        # These selections from DB have normcased paths.
 
         if not selections_for_context:
             self.notification_widget.show_message(
                 "Prompt copied to clipboard.\nNo files/directories selected for context.txt under the current filter.",
                 anchor_widget=anchor_widget
             )
-            # Save positions even if no context file is generated
             if self.isVisible() and not self.isMinimized(): self.save_gui_position()
-            elif self.hover_widget and self.hover_widget.isVisible(): self.hover_widget.save_current_position() # Use hover_widget's own save
+            elif self.hover_widget and self.hover_widget.isVisible(): self.hover_widget.save_current_position()
             return
 
         context_file_leaf_name = "context.txt"
         try:
-            # Consolidate all binary-like extensions
             binary_like_extensions = list(set(
-                self.BINARY_EXTENSIONS + 
-                self.RASTER_IMAGE_EXTENSIONS + 
+                self.BINARY_EXTENSIONS +
+                self.RASTER_IMAGE_EXTENSIONS +
                 self.SVG_IMAGE_EXTENSIONS
             ))
 
-            # Generate context file data
-            # Pass the original-case project path for context_generator, as it might be used for display or relative path construction
-            # Selections still contain normcased paths for internal logic.
             context_lines = context_generator.generate_context_file_data(
-                original_project_path_from_db, 
-                selections_for_context, # These have normcased paths
+                original_project_path_from_db,
+                selections_for_context,
                 binary_like_extensions,
                 context_file_leaf_name
             )
@@ -977,75 +1021,61 @@ class MainWindow(QMainWindow):
             print(f"Context generation error: {e}")
             return
 
-        # Define full path for context.txt using the original-case project path
         context_file_full_path = os.path.join(original_project_path_from_db, context_file_leaf_name)
-
         try:
             with open(context_file_full_path, 'w', encoding='utf-8') as f:
                 f.write("\n".join(context_lines))
-            
+
             self.notification_widget.show_message(
                 f"Context file generated: {context_file_leaf_name}\nPrompt copied to clipboard.",
                 anchor_widget=anchor_widget
             )
-            
-            # Refresh file tree to show the new/updated context.txt
-            self.refresh_file_tree_display_indicators() # General refresh for asterisks
-            
-            # Attempt to select and scroll to the generated context.txt in the tree view
-            if self.fs_model and self.tree_view:
-                # We need the model index for the original-case path
+
+            self.refresh_file_tree_display_indicators()
+            if self.fs_model and self.tree_view and self.fs_model.rootPath() != "":
                 context_file_model_index = self.fs_model.index(context_file_full_path)
                 if context_file_model_index.isValid():
                     self.tree_view.setCurrentIndex(context_file_model_index)
                     self.tree_view.scrollTo(context_file_model_index, QAbstractItemView.PositionAtCenter)
-                    # Also trigger preview update for the newly selected context.txt
-                    self._show_preview_for_path(context_file_full_path) 
+                    self._show_preview_for_path(context_file_full_path)
                 else:
-                    # If index not found (e.g., tree not fully populated or path issue),
-                    # still try to show preview directly.
-                    # print(f"Info: context.txt index not found for: '{context_file_full_path}'. Forcing preview.")
                     self._show_preview_for_path(context_file_full_path)
 
         except Exception as e:
             QMessageBox.critical(self, "Error Saving Context File", f"Could not save '{context_file_leaf_name}': {e}")
             print(f"Error saving '{context_file_leaf_name}': {e}")
 
-        # Save positions after action
         if self.isVisible() and not self.isMinimized(): self.save_gui_position()
         elif self.hover_widget and self.hover_widget.isVisible(): self.hover_widget.save_current_position()
 
 
     def collapse_to_hover_icon(self):
-        self.save_gui_position() # Save main window position before hiding
+        self.save_gui_position()
         self.hide()
-        db_manager.set_app_setting(LAST_UI_MODE_KEY, 'hover') # Record that we are in hover mode
+        db_manager.set_app_setting(LAST_UI_MODE_KEY, 'hover')
 
-        # Try to load and set the hover icon's last known position
         try:
             hover_x_str = db_manager.get_app_setting(HOVER_POS_X_KEY)
             hover_y_str = db_manager.get_app_setting(HOVER_POS_Y_KEY)
             if hover_x_str is not None and hover_y_str is not None:
                 self.hover_widget.move(QPoint(int(hover_x_str), int(hover_y_str)))
             else:
-                self._center_hover_icon_on_primary_screen() # Fallback to centering
+                self._center_hover_icon_on_primary_screen()
         except (ValueError, TypeError) as e:
             print(f"Warning: Could not parse saved hover icon position on collapse ({e}). Using default.")
             self._center_hover_icon_on_primary_screen()
-        except Exception as e: # Catch any other potential errors during position loading
+        except Exception as e:
             print(f"Error loading hover icon position on collapse: {e}. Using default.")
             self._center_hover_icon_on_primary_screen()
-        
+
         self.hover_widget.show()
 
-    def show_main_window_from_hover(self, hover_screen): # hover_screen is QScreen object
+    def show_main_window_from_hover(self, hover_screen: QGuiApplication.primaryScreen()):
         if self.hover_widget:
-            self.hover_widget.save_current_position() # Save hover icon's position before hiding it
+            self.hover_widget.save_current_position()
             self.hover_widget.hide()
-        
-        db_manager.set_app_setting(LAST_UI_MODE_KEY, 'gui') # Record that we are in GUI mode
 
-        # Try to load and set the main GUI's last known position
+        db_manager.set_app_setting(LAST_UI_MODE_KEY, 'gui')
         gui_restored_to_saved_pos = False
         try:
             gui_x_str = db_manager.get_app_setting(GUI_POS_X_KEY)
@@ -1059,116 +1089,96 @@ class MainWindow(QMainWindow):
             print(f"Error loading GUI position on expand: {e}. Using default.")
 
         if not gui_restored_to_saved_pos:
-            # Fallback positioning logic if saved position wasn't loaded
-            target_screen = hover_screen or QGuiApplication.primaryScreen() # Use provided screen or primary
+            target_screen = hover_screen or QGuiApplication.primaryScreen()
             if target_screen:
                 screen_geometry = target_screen.availableGeometry()
-                # Center the window on the target screen
                 self.move(screen_geometry.center() - self.rect().center())
             else:
-                self._center_on_primary_screen() # Absolute fallback
+                self._center_on_primary_screen()
 
         self.show()
-        self.activateWindow() # Bring to front
-        self.raise_()         # Ensure it's on top of other windows
-
+        self.activateWindow()
+        self.raise_()
 
     def close_application_from_hover(self):
         if self.hover_widget:
-            self.hover_widget.save_current_position() # Save hover icon position
-        self.close() # Trigger the main window's closeEvent
+            self.hover_widget.save_current_position()
+        self.close()
 
     def closeEvent(self, event):
-        # Ensure any pending prompt guide changes are saved
         if self.prompt_save_timer.isActive():
             self.prompt_save_timer.stop()
             self.save_prompt_guide_to_db()
 
-        # Save current UI state (position and mode)
-        if self.isVisible() and not self.isMinimized(): # If main GUI is visible
+        if self.isVisible() and not self.isMinimized():
             self.save_gui_position()
             db_manager.set_app_setting(LAST_UI_MODE_KEY, 'gui')
-        else: # If main GUI is hidden (implies hover icon was likely active or app was minimized)
-            if self.hover_widget and self.hover_widget.isVisible(): # If hover icon is explicitly visible
-                 self.hover_widget.save_current_position() # Use hover_widget's own save
+        else:
+            if self.hover_widget and self.hover_widget.isVisible():
+                 self.hover_widget.save_current_position()
                  db_manager.set_app_setting(LAST_UI_MODE_KEY, 'hover')
-            else: # Main window hidden, hover icon also hidden (e.g. minimized from hover)
-                  # We need to decide what the 'last mode' should be.
-                  # If it was previously 'hover', keep it as 'hover'. Otherwise, 'gui'.
+            else:
                   last_known_mode = db_manager.get_app_setting(LAST_UI_MODE_KEY)
                   if last_known_mode == 'hover':
-                      # If it was hover mode, ensure hover position is saved (might be redundant but safe)
-                      self.save_hover_icon_position() # MainWindow saves its knowledge of hover pos
-                  else: # Default to saving GUI position and mode if last mode wasn't explicitly hover
+                      pass
+                  else:
                       self.save_gui_position()
                       db_manager.set_app_setting(LAST_UI_MODE_KEY, 'gui')
 
 
-        # Clean up child widgets that might persist
         if hasattr(self, 'notification_widget') and self.notification_widget:
-            self.notification_widget.close() # Ensure notification is closed
-        
+            self.notification_widget.close()
         if hasattr(self, 'hover_widget') and self.hover_widget:
-            # self.hover_widget.close() # This might re-trigger saves, let QApplication handle its closure
             pass
 
-
-        super().closeEvent(event) # Call base class closeEvent
+        super().closeEvent(event)
         if event.isAccepted():
-            QApplication.instance().quit() # Ensure application quits fully
+            QApplication.instance().quit()
 
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
 
-    # Set application icon
-    icon_path = "contextdropper.png" # Ensure this icon exists or handle absence
+    icon_path = "contextdropper.png"
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
     else:
         print(f"Warning: Application icon '{icon_path}' not found.")
 
-    # Apply a base style (Fusion is good for consistency across platforms)
     app.setStyle("Fusion")
 
-    # Dark theme palette (example, can be customized further)
     dark_palette = QPalette()
     dark_palette.setColor(QPalette.Window, QColor(53, 53, 53))
     dark_palette.setColor(QPalette.WindowText, Qt.white)
-    dark_palette.setColor(QPalette.Base, QColor(35, 35, 35)) # Background for text entry widgets
-    dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53)) # Used for alternating row colors
+    dark_palette.setColor(QPalette.Base, QColor(35, 35, 35))
+    dark_palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
     dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
-    dark_palette.setColor(QPalette.ToolTipText, Qt.black) # Ensure tooltip text is readable
+    dark_palette.setColor(QPalette.ToolTipText, Qt.black)
     dark_palette.setColor(QPalette.Text, Qt.white)
     dark_palette.setColor(QPalette.Button, QColor(53, 53, 53))
     dark_palette.setColor(QPalette.ButtonText, Qt.white)
     dark_palette.setColor(QPalette.BrightText, Qt.red)
     dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
-    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218)) # Selection color
-    dark_palette.setColor(QPalette.HighlightedText, Qt.black) # Text color for selected items
-    dark_palette.setColor(QPalette.PlaceholderText, QColor(128,128,128)) # Color for placeholder text
+    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+    dark_palette.setColor(QPalette.PlaceholderText, QColor(128,128,128))
     app.setPalette(dark_palette)
 
-    # Global stylesheet for tooltips (if needed beyond palette)
     app.setStyleSheet("QToolTip { color: #000000; background-color: #ffffff; border: 1px solid black; }")
 
 
-    # Initialize database (ensure it exists and tables are created)
     if not os.path.exists(db_manager.DATABASE_NAME):
         print(f"Database '{db_manager.DATABASE_NAME}' not found. Initializing...")
-        db_manager.init_db() # Creates DB and tables
+        db_manager.init_db()
     else:
         print(f"Database '{db_manager.DATABASE_NAME}' found. Ensuring schema is up-to-date...")
-        db_manager.init_db() # Ensures tables exist, doesn't alter existing ones by default
+        db_manager.init_db()
 
     window = MainWindow()
 
-    # Determine initial mode (GUI or Hover) based on saved setting
     if window.initial_mode == "hover":
-        # If starting in hover mode, don't show main window initially
-        # The collapse_to_hover_icon method will show the hover icon
         window.collapse_to_hover_icon()
     else:
-        window.show() # Show main GUI window
+        window.show()
 
     sys.exit(app.exec())
