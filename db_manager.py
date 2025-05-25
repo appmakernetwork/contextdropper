@@ -3,6 +3,11 @@ import os
 
 DATABASE_NAME = 'context_dropper.db'
 
+# Default AI prompt guide for new projects
+DEFAULT_NEW_PROJECT_PROMPT = """[2-4 Sentence description of this project goes here]
+I need your help with the following task progressing this project forwards. When providing code changes, please output the complete content of any modified files in their entirety. Do not provide only snippets or diffs; I need the full file content to easily replace my existing files. 
+My question is:"""
+
 def get_db_connection():
     """Establishes a connection to the SQLite database."""
     conn = sqlite3.connect(DATABASE_NAME)
@@ -83,7 +88,17 @@ def set_app_setting(key, value):
         conn.close()
 
 # --- Project Functions ---
-def add_project(name, path, prompt_guide=""):
+def add_project(name, path, prompt_guide=DEFAULT_NEW_PROJECT_PROMPT):
+    """
+    Adds a new project to the database.
+    Args:
+        name (str): The name of the project.
+        path (str): The root path of the project.
+        prompt_guide (str, optional): The initial AI prompt guide.
+                                      Defaults to DEFAULT_NEW_PROJECT_PROMPT.
+    Returns:
+        int or None: The ID of the newly created project, or None if an error occurred.
+    """
     conn = get_db_connection()
     try:
         # Store the original path for projects, normcasing is mainly for selections uniqueness/lookup
